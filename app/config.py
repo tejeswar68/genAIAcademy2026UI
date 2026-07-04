@@ -35,6 +35,11 @@ class Settings:
     # Accepted upload formats (Streamlit file_uploader ``type`` argument).
     allowed_image_types: tuple[str, ...] = ("jpg", "png", "jpeg")
 
+    # Backend upload endpoint (Cloud Run function). When set, uploaded snapshots
+    # are POSTed here for storage in Cloud Storage. Empty -> upload is skipped
+    # and the UI runs on the local mock only.
+    upload_url: str = os.getenv("CIVICEYE_UPLOAD_URL", "")
+
     # Default map coordinates, stored as signed decimal degrees (WGS-84).
     #
     # Source (DMS): 17°29′48″N  78°21′41″E  (Hyderabad, IN)

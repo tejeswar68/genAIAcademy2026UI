@@ -13,7 +13,7 @@ import streamlit as st
 
 from app import styles
 from app.config import settings
-from app.services import analysis_service, incident_store
+from app.services import analysis_service, incident_store, upload_service
 from app.services.image_service import ImageLoadError, load_image
 
 
@@ -48,11 +48,47 @@ def _map_preview(latitude: float, longitude: float) -> None:
     )
 
 
-def _run_analysis(image, image_bytes: bytes, latitude: float, longitude: float) -> None:
+def _upload_to_backend(
+    image_bytes: bytes, filename: str, content_type: str, latitude: float, longitude: float
+) -> str | None:
+    """Store the snapshot via the backend; return its ``gs://`` URI or None.
+
+    Non-fatal: if no backend is configured or the call fails, we surface a
+    message and continue so the demo still runs on the local mock.
+    """
+    if not upload_service.is_enabled():
+        st.write("💾  Cloud Storage backend not configured — skipping upload.")
+        return None
+    try:
+        upload = upload_service.upload_snapshot(
+            image_bytes,
+            filename=filename,
+            content_type=content_type,
+            latitude=latitude,
+            longitude=longitude,
+        )
+        st.write(f"☁️  Snapshot stored in Cloud Storage → `{upload.gs_uri}`")
+        return upload.gs_uri
+    except upload_service.UploadError as exc:
+        st.write(f"⚠️  Cloud Storage upload failed: {exc}")
+        return None
+
+
+def _run_analysis(
+    image,
+    image_bytes: bytes,
+    filename: str,
+    content_type: str,
+    latitude: float,
+    longitude: float,
+) -> None:
     """Simulate the orchestration/agent pipeline with visible progress."""
     with st.status("Running CivicEYEAI multi-agent analysis…", expanded=True) as status:
         st.write("🛰️  Ingesting geo-tagged snapshot…")
         time.sleep(0.5)
+        gs_uri = _upload_to_backend(
+            image_bytes, filename, content_type, latitude, longitude
+        )
         for agent in analysis_service.AGENTS:
             st.write(f"{agent['icon']}  {agent['name']} scanning for {agent['label']}…")
             time.sleep(0.45)
@@ -63,6 +99,7 @@ def _run_analysis(image, image_bytes: bytes, latitude: float, longitude: float) 
         status.update(label="Analysis complete", state="complete", expanded=False)
 
     result = analysis_service.analyze(image_bytes, latitude, longitude, thumbnail=image)
+    result.meta["gs_uri"] = gs_uri
     incident_store.add_from_analysis(result)
     st.session_state["last_analysis"] = result
 
@@ -109,6 +146,10 @@ def _render_result() -> None:
         st.markdown("**✨ Gemini Recommendation**")
         st.info(result.summary)
         st.caption(f"Analyzed at {result.analyzed_at} · added to Reported Incidents")
+
+        gs_uri = result.meta.get("gs_uri")
+        if gs_uri:
+            st.caption(f"☁️ Stored in Cloud Storage: `{gs_uri}`")
 
 
 def render() -> None:
@@ -166,7 +207,14 @@ def render() -> None:
         if image is None:
             st.warning("Please upload a snapshot before analyzing.")
         else:
-            _run_analysis(image, image_bytes, latitude, longitude)
+            _run_analysis(
+                image,
+                image_bytes,
+                filename=uploaded_file.name,
+                content_type=uploaded_file.type or "image/jpeg",
+                latitude=latitude,
+                longitude=longitude,
+            )
             st.toast("Snapshot analyzed — incidents updated", icon="🛰️")
 
     _render_result()
