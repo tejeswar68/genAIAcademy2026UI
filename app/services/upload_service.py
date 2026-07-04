@@ -33,20 +33,31 @@ class UploadResult:
     size_bytes: int
 
 
+def _secret(name: str) -> str:
+    """Read a value from Streamlit secrets, returning "" if unavailable.
+
+    ``st.secrets`` raises when no secrets file exists, so this swallows that and
+    lets the caller fall back to env/config.
+    """
+    try:
+        value = st.secrets.get(name)  # type: ignore[attr-defined]
+    except Exception:
+        return ""
+    return str(value) if value else ""
+
+
 def _backend_url() -> str:
     """Resolve the backend URL from Streamlit secrets, then env/config.
 
     Streamlit Community Cloud exposes configuration via ``st.secrets``; local
     runs fall back to the ``CIVICEYE_UPLOAD_URL`` environment variable.
     """
-    try:
-        secret = st.secrets.get("CIVICEYE_UPLOAD_URL")  # type: ignore[attr-defined]
-        if secret:
-            return str(secret)
-    except Exception:
-        # st.secrets raises if no secrets file exists — ignore and use config.
-        pass
-    return settings.upload_url
+    return _secret("CIVICEYE_UPLOAD_URL") or settings.upload_url
+
+
+def _api_key() -> str:
+    """Resolve the backend API key from Streamlit secrets, then env/config."""
+    return _secret("CIVICEYE_API_KEY") or settings.api_key
 
 
 def is_enabled() -> bool:
@@ -71,11 +82,18 @@ def upload_snapshot(
     if not url:
         raise UploadError("No upload backend configured.")
 
+    # Authenticate with the backend's shared secret when one is configured.
+    headers = {}
+    api_key = _api_key()
+    if api_key:
+        headers["X-API-Key"] = api_key
+
     try:
         response = requests.post(
             url,
             files={"image": (filename, image_bytes, content_type)},
             data={"latitude": str(latitude), "longitude": str(longitude)},
+            headers=headers,
             timeout=_TIMEOUT,
         )
         response.raise_for_status()

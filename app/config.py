@@ -40,6 +40,10 @@ class Settings:
     # and the UI runs on the local mock only.
     upload_url: str = os.getenv("CIVICEYE_UPLOAD_URL", "")
 
+    # Shared secret sent as the ``X-API-Key`` header to authenticate with the
+    # backend. Prefer Streamlit secrets in production; empty -> no auth header.
+    api_key: str = os.getenv("CIVICEYE_API_KEY", "")
+
     # Default map coordinates, stored as signed decimal degrees (WGS-84).
     #
     # Source (DMS): 17°29′48″N  78°21′41″E  (Hyderabad, IN)
