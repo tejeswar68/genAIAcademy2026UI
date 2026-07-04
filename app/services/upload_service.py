@@ -8,6 +8,7 @@ the caller treats upload as skipped, so the app still runs on the local mock.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
 import requests
@@ -65,6 +66,17 @@ def is_enabled() -> bool:
     return bool(_backend_url())
 
 
+def backend_url() -> str:
+    """Public accessor for the resolved backend base URL (may be empty)."""
+    return _backend_url()
+
+
+def auth_headers() -> dict[str, str]:
+    """Return the ``X-API-Key`` header when a key is configured, else empty."""
+    api_key = _api_key()
+    return {"X-API-Key": api_key} if api_key else {}
+
+
 def upload_snapshot(
     image_bytes: bytes,
     *,
@@ -72,8 +84,12 @@ def upload_snapshot(
     content_type: str,
     latitude: float,
     longitude: float,
+    analysis: dict | None = None,
 ) -> UploadResult:
     """POST the snapshot to the backend for Cloud Storage upload.
+
+    ``analysis`` (if given) is sent as a JSON form field and persisted as
+    object metadata, so the read screens can rebuild incidents from the bucket.
 
     Raises:
         UploadError: If no backend is configured or the request fails.
@@ -82,17 +98,17 @@ def upload_snapshot(
     if not url:
         raise UploadError("No upload backend configured.")
 
-    # Authenticate with the backend's shared secret when one is configured.
-    headers = {}
-    api_key = _api_key()
-    if api_key:
-        headers["X-API-Key"] = api_key
+    headers = auth_headers()
+
+    data = {"latitude": str(latitude), "longitude": str(longitude)}
+    if analysis is not None:
+        data["analysis"] = json.dumps(analysis, separators=(",", ":"))
 
     try:
         response = requests.post(
             url,
             files={"image": (filename, image_bytes, content_type)},
-            data={"latitude": str(latitude), "longitude": str(longitude)},
+            data=data,
             headers=headers,
             timeout=_TIMEOUT,
         )

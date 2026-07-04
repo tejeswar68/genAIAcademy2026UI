@@ -7,18 +7,18 @@ defaults, which keeps deployments configurable without code changes.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
+# Load a local ``.env`` (if present) into the environment before settings are
+# read. On Streamlit Community Cloud there is no ``.env`` — config comes from
+# ``st.secrets`` / env vars — so a missing file is a no-op. Without this, a
+# local ``.env`` is silently ignored and the backend upload is skipped.
+try:
+    from dotenv import load_dotenv
 
-def _env_float(key: str, default: float) -> float:
-    """Read a float from the environment, falling back to ``default``."""
-    raw = os.getenv(key)
-    if raw is None or raw.strip() == "":
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        return default
+    load_dotenv()
+except ModuleNotFoundError:  # dotenv is optional; env vars still work without it.
+    pass
 
 
 @dataclass(frozen=True)
@@ -44,20 +44,8 @@ class Settings:
     # backend. Prefer Streamlit secrets in production; empty -> no auth header.
     api_key: str = os.getenv("CIVICEYE_API_KEY", "")
 
-    # Default map coordinates, stored as signed decimal degrees (WGS-84).
-    #
-    # Source (DMS): 17°29′48″N  78°21′41″E  (Hyderabad, IN)
-    # DMS -> decimal:  deg + min/60 + sec/3600, negate for S / W.
-    #   Lat: 17 + 29/60 + 48/3600 = 17.496667  (N -> positive)
-    #   Lon: 78 + 21/60 + 41/3600 = 78.361389  (E -> positive)
-    #
-    # Displayed via ``coordinate_format`` ("%.6f") -> 6 decimals ≈ 0.11 m.
-    default_latitude: float = field(
-        default_factory=lambda: _env_float("CIVICEYE_DEFAULT_LAT", 17.496667)
-    )
-    default_longitude: float = field(
-        default_factory=lambda: _env_float("CIVICEYE_DEFAULT_LON", 78.361389)
-    )
+    # Coordinates are entered per-snapshot by the operator — there are no
+    # default map coordinates. Displayed with 6 decimals (≈ 0.11 m).
     coordinate_format: str = "%.6f"
 
 

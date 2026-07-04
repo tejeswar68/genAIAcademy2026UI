@@ -60,6 +60,29 @@ class AnalysisResult:
             return "Low"
         return max(self.detections, key=lambda d: _SEVERITY_ORDER[d.severity]).severity
 
+    def to_metadata(self) -> dict:
+        """JSON-serializable view persisted as Cloud Storage object metadata.
+
+        This is what the Dashboard / Reported Incidents screens read back to
+        rebuild incidents from the bucket, so it carries every field those
+        screens need (detections, per-detection status, summary, timestamp).
+        """
+        return {
+            "analyzed_at": self.analyzed_at,
+            "summary": self.summary,
+            "detections": [
+                {
+                    "agent": d.agent,
+                    "issue_type": d.issue_type,
+                    "confidence": d.confidence,
+                    "severity": d.severity,
+                    "status": "Open",
+                    "recommendation": d.recommendation,
+                }
+                for d in self.detections
+            ],
+        }
+
 
 def _seed_from_image(image_bytes: bytes) -> int:
     """Derive a stable seed from image content."""

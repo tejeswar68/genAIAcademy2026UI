@@ -1,8 +1,14 @@
 """Upload Snapshot screen.
 
 Lets an operator upload a drone snapshot, tag it with geo-coordinates, and run
-the (simulated) multi-agent AI analysis. Detected issues flow into the shared
-incident store for the Reported Incidents and Dashboard screens.
+the multi-agent AI analysis. Detected issues flow into the shared incident
+store for the Reported Incidents and Dashboard screens.
+
+State model
+-----------
+A single session ``nonce`` keys the input widgets. "Upload another image"
+increments the nonce, which gives the uploader and coordinate fields fresh keys
+so Streamlit renders them empty — a clean reset without stale values.
 """
 from __future__ import annotations
 
@@ -16,27 +22,47 @@ from app.config import settings
 from app.services import analysis_service, incident_store, upload_service
 from app.services.image_service import ImageLoadError, load_image
 
+# Session-state keys.
+_NONCE = "upload_nonce"          # int — bumped to reset input widgets
+_RESULT = "last_analysis"        # AnalysisResult | None
 
-def _parse_coordinate(raw: str, fallback: float) -> float:
-    """Parse a decimal-degree string, falling back on empty/invalid input."""
+
+def _nonce() -> int:
+    """Current form nonce (used to key/reset the input widgets)."""
+    if _NONCE not in st.session_state:
+        st.session_state[_NONCE] = 0
+    return st.session_state[_NONCE]
+
+
+def _reset_for_new_upload() -> None:
+    """Clear the last result and bump the nonce so inputs render empty."""
+    st.session_state[_RESULT] = None
+    st.session_state[_NONCE] = _nonce() + 1
+
+
+def _parse_coordinate(raw: str) -> float | None:
+    """Parse a decimal-degree string; return None if empty or invalid."""
     try:
         return float(raw.strip())
     except (ValueError, AttributeError):
-        return fallback
+        return None
 
 
-def _coordinate_inputs() -> tuple[float, float]:
-    """Render the lat/lon inputs inside a card and return their values.
+def _coordinate_inputs(nonce: int) -> tuple[float | None, float | None]:
+    """Render the lat/lon inputs and return their parsed values (or None).
 
-    Uses text inputs (not number_input) so there are no +/- steppers and the
-    value shows as a plain decimal, e.g. ``17.496667``.
+    Text inputs (not number_input) so there are no +/- steppers and the value
+    shows as a plain decimal, e.g. ``17.496667``. No default is applied —
+    coordinates must be entered by the operator.
     """
-    st.markdown('<div class="ce-card-title">Geo-tag</div>', unsafe_allow_html=True)
-    lat_raw = st.text_input("Latitude", value="", placeholder="e.g. 17.496667")
-    lon_raw = st.text_input("Longitude", value="", placeholder="e.g. 78.361389")
-    latitude = _parse_coordinate(lat_raw, settings.default_latitude)
-    longitude = _parse_coordinate(lon_raw, settings.default_longitude)
-    return latitude, longitude
+    styles.card_title("Geo-tag")
+    lat_raw = st.text_input(
+        "Latitude", value="", placeholder="e.g. 17.496667", key=f"lat_{nonce}"
+    )
+    lon_raw = st.text_input(
+        "Longitude", value="", placeholder="e.g. 78.361389", key=f"lon_{nonce}"
+    )
+    return _parse_coordinate(lat_raw), _parse_coordinate(lon_raw)
 
 
 def _map_preview(latitude: float, longitude: float) -> None:
@@ -49,16 +75,21 @@ def _map_preview(latitude: float, longitude: float) -> None:
 
 
 def _upload_to_backend(
-    image_bytes: bytes, filename: str, content_type: str, latitude: float, longitude: float
-) -> str | None:
-    """Store the snapshot via the backend; return its ``gs://`` URI or None.
+    image_bytes: bytes,
+    filename: str,
+    content_type: str,
+    latitude: float,
+    longitude: float,
+    analysis: dict,
+) -> tuple[str | None, str]:
+    """Store the snapshot (with its analysis) via the backend Cloud Function.
 
-    Non-fatal: if no backend is configured or the call fails, we surface a
-    message and continue so the demo still runs on the local mock.
+    Returns ``(gs_uri, status)`` where ``status`` is one of
+    ``"skipped" | "success" | "failed"`` for explicit UI reporting. The analysis
+    is persisted as object metadata so the read screens can rebuild incidents.
     """
     if not upload_service.is_enabled():
-        st.write("💾  Cloud Storage backend not configured — skipping upload.")
-        return None
+        return None, "skipped"
     try:
         upload = upload_service.upload_snapshot(
             image_bytes,
@@ -66,12 +97,12 @@ def _upload_to_backend(
             content_type=content_type,
             latitude=latitude,
             longitude=longitude,
+            analysis=analysis,
         )
-        st.write(f"☁️  Snapshot stored in Cloud Storage → `{upload.gs_uri}`")
-        return upload.gs_uri
+        return upload.gs_uri, "success"
     except upload_service.UploadError as exc:
-        st.write(f"⚠️  Cloud Storage upload failed: {exc}")
-        return None
+        st.session_state["_upload_error"] = str(exc)
+        return None, "failed"
 
 
 def _run_analysis(
@@ -82,38 +113,86 @@ def _run_analysis(
     latitude: float,
     longitude: float,
 ) -> None:
-    """Simulate the orchestration/agent pipeline with visible progress."""
-    with st.status("Running CivicEYEAI multi-agent analysis…", expanded=True) as status:
+    """Run the orchestration/agent pipeline with a visible, stateful status."""
+    with st.status(
+        "Running CivicEYEAI multi-agent analysis…", expanded=True
+    ) as status:
         st.write("🛰️  Ingesting geo-tagged snapshot…")
-        time.sleep(0.5)
-        gs_uri = _upload_to_backend(
-            image_bytes, filename, content_type, latitude, longitude
-        )
+        time.sleep(0.4)
+
         for agent in analysis_service.AGENTS:
             st.write(f"{agent['icon']}  {agent['name']} scanning for {agent['label']}…")
-            time.sleep(0.45)
+            time.sleep(0.4)
         st.write("🧠  Issue Intelligence Layer scoring severity…")
-        time.sleep(0.5)
+        time.sleep(0.4)
         st.write("✨  Gemini generating recommendations…")
-        time.sleep(0.5)
-        status.update(label="Analysis complete", state="complete", expanded=False)
+        time.sleep(0.4)
 
-    result = analysis_service.analyze(image_bytes, latitude, longitude, thumbnail=image)
+        # Run the analysis first so its result can be persisted with the image.
+        result = analysis_service.analyze(
+            image_bytes, latitude, longitude, thumbnail=image
+        )
+
+        st.write("☁️  Storing snapshot + analysis in Cloud Storage…")
+        gs_uri, upload_status = _upload_to_backend(
+            image_bytes,
+            filename,
+            content_type,
+            latitude,
+            longitude,
+            analysis=result.to_metadata(),
+        )
+        if upload_status == "success":
+            st.write(f"✅  Stored in Cloud Storage → `{gs_uri}`")
+        elif upload_status == "skipped":
+            st.write("⏭️  Backend not configured — result not persisted.")
+        else:
+            err = st.session_state.get("_upload_error", "unknown error")
+            st.write(f"❌  Cloud Storage upload failed: {err}")
+
+        if upload_status == "failed":
+            status.update(
+                label="Analysis complete (backend upload failed)",
+                state="error",
+                expanded=False,
+            )
+        else:
+            status.update(label="Analysis complete", state="complete", expanded=False)
+
     result.meta["gs_uri"] = gs_uri
-    incident_store.add_from_analysis(result)
-    st.session_state["last_analysis"] = result
+    result.meta["upload_status"] = upload_status
+    # New snapshot persisted — drop the cached list so the read screens refetch.
+    if upload_status == "success":
+        incident_store.refresh()
+    st.session_state[_RESULT] = result
+
+
+def _render_backend_status(result: "analysis_service.AnalysisResult") -> None:
+    """Show the backend/Cloud Storage call state explicitly as a status chip."""
+    status = result.meta.get("upload_status", "skipped")
+    gs_uri = result.meta.get("gs_uri")
+    if status == "success":
+        st.success(f"☁️ Cloud Storage: **stored** · `{gs_uri}`", icon="✅")
+    elif status == "failed":
+        err = st.session_state.get("_upload_error", "upload failed")
+        st.error(f"☁️ Cloud Storage: **failed** — {err}", icon="❌")
+    else:
+        st.warning("☁️ Cloud Storage: **skipped** — backend not configured.", icon="⏭️")
 
 
 def _render_result() -> None:
     """Render the most recent analysis result, if any."""
-    result: analysis_service.AnalysisResult | None = st.session_state.get("last_analysis")
+    result: analysis_service.AnalysisResult | None = st.session_state.get(_RESULT)
     if result is None:
         return
 
     st.write("")
     with st.container(border=True):
-        st.markdown('<div class="ce-card-title">Analysis Result</div>', unsafe_allow_html=True)
+        styles.card_title("Analysis Result")
 
+        _render_backend_status(result)
+
+        st.write("")
         top = result.top_severity
         c1, c2, c3 = st.columns(3)
         c1.metric("Issues Detected", len(result.detections))
@@ -145,11 +224,18 @@ def _render_result() -> None:
         st.write("")
         st.markdown("**✨ Gemini Recommendation**")
         st.info(result.summary)
-        st.caption(f"Analyzed at {result.analyzed_at} · added to Reported Incidents")
+        caption = f"Analyzed at {result.analyzed_at}"
+        if result.meta.get("upload_status") == "success":
+            caption += " · added to Reported Incidents & Dashboard"
+        st.caption(caption)
 
-        gs_uri = result.meta.get("gs_uri")
-        if gs_uri:
-            st.caption(f"☁️ Stored in Cloud Storage: `{gs_uri}`")
+    # --- Reset: analyze another snapshot ---
+    st.write("")
+    st.button(
+        "⬆️ Upload Another Image",
+        on_click=_reset_for_new_upload,
+        width="stretch",
+    )
 
 
 def render() -> None:
@@ -157,55 +243,69 @@ def render() -> None:
     styles.inject()
     styles.hero(settings.app_title, settings.app_subtitle, settings.app_icon)
 
+    # Once an analysis exists, show only the result + reset button.
+    if st.session_state.get(_RESULT) is not None:
+        _render_result()
+        return
+
+    nonce = _nonce()
     left, right = st.columns([1, 1], gap="large")
 
     # --- Left column: upload + coordinates ---
     with left:
         with st.container(border=True):
-            st.markdown(
-                '<div class="ce-card-title">Drone Snapshot</div>',
-                unsafe_allow_html=True,
-            )
+            styles.card_title("Drone Snapshot")
             uploaded_file = st.file_uploader(
                 "Upload Drone Snapshot",
                 type=list(settings.allowed_image_types),
                 label_visibility="collapsed",
+                key=f"uploader_{nonce}",
             )
 
         with st.container(border=True):
-            latitude, longitude = _coordinate_inputs()
+            latitude, longitude = _coordinate_inputs(nonce)
 
     # --- Right column: preview ---
     image = None
     image_bytes = b""
     with right:
         with st.container(border=True):
-            st.markdown('<div class="ce-card-title">Preview</div>', unsafe_allow_html=True)
-            if uploaded_file is not None:
-                try:
-                    image = load_image(uploaded_file)
-                except ImageLoadError as exc:
-                    st.error(str(exc))
-                else:
-                    image_bytes = uploaded_file.getvalue()
-                    st.image(image, caption="Uploaded Snapshot", width="stretch")
-            else:
-                st.info("Upload a snapshot to see the preview here.")
+            styles.card_title("Preview")
+            # Image preview and location preview side by side (not stacked).
+            img_col, map_col = st.columns([1, 1], gap="medium")
 
-            _map_preview(latitude, longitude)
+            with img_col:
+                if uploaded_file is not None:
+                    try:
+                        image = load_image(uploaded_file)
+                    except ImageLoadError as exc:
+                        st.error(str(exc))
+                    else:
+                        image_bytes = uploaded_file.getvalue()
+                        st.image(image, caption="Uploaded Snapshot", width="stretch")
+                else:
+                    st.info("Upload a snapshot to see the preview here.")
+
+            with map_col:
+                if latitude is not None and longitude is not None:
+                    _map_preview(latitude, longitude)
+                else:
+                    st.caption("Enter latitude & longitude to preview the location.")
 
     # --- Geo-tag metrics ---
     st.write("")
     m1, m2, m3 = st.columns(3)
-    m1.metric("Latitude", f"{latitude:.6f}")
-    m2.metric("Longitude", f"{longitude:.6f}")
+    m1.metric("Latitude", f"{latitude:.6f}" if latitude is not None else "—")
+    m2.metric("Longitude", f"{longitude:.6f}" if longitude is not None else "—")
     m3.metric("Snapshot", "Ready" if image is not None else "Pending")
 
     # --- Action ---
     st.write("")
-    if st.button("🔍 Analyze Snapshot"):
+    if st.button("🔍 Analyze Snapshot", width="stretch"):
         if image is None:
             st.warning("Please upload a snapshot before analyzing.")
+        elif latitude is None or longitude is None:
+            st.warning("Please enter both latitude and longitude before analyzing.")
         else:
             _run_analysis(
                 image,
@@ -215,6 +315,4 @@ def render() -> None:
                 latitude=latitude,
                 longitude=longitude,
             )
-            st.toast("Snapshot analyzed — incidents updated", icon="🛰️")
-
-    _render_result()
+            st.rerun()

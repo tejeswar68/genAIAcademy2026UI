@@ -131,6 +131,11 @@ def hero(title: str, subtitle: str, icon: str = "") -> None:
     )
 
 
+def card_title(text: str) -> None:
+    """Render a section-card title (the uppercase label used inside cards)."""
+    st.markdown(f'<div class="ce-card-title">{text}</div>', unsafe_allow_html=True)
+
+
 def severity_badge(severity: str) -> str:
     """Return an HTML badge string for a severity level."""
     cls = f"ce-badge-{severity.lower()}"
