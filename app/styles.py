@@ -14,10 +14,13 @@ _ACCENT = "#0ea5e9"
 
 _CSS = f"""
 <style>
-  /* Tighten the default top padding so the hero sits higher */
+  /* Tighten the default top padding so the hero sits higher. Use the full
+     wide-layout width (with comfortable side padding) so previews/maps are big. */
   .block-container {{
       padding-top: 2.2rem;
-      max-width: 1000px;
+      max-width: 1600px;
+      padding-left: 2.5rem;
+      padding-right: 2.5rem;
   }}
 
   /* Hero banner */
@@ -83,6 +86,23 @@ _CSS = f"""
       border-radius: 12px;
   }}
 
+  /* Directions link styled as a pill button */
+  a.ce-directions {{
+      display: inline-block;
+      padding: 0.45rem 0.95rem;
+      border-radius: 10px;
+      background: rgba(37, 99, 235, 0.1);
+      color: {_PRIMARY};
+      font-weight: 600;
+      text-decoration: none;
+      border: 1px solid rgba(37, 99, 235, 0.3);
+      transition: background 0.15s ease;
+  }}
+  a.ce-directions:hover {{
+      background: rgba(37, 99, 235, 0.2);
+      text-decoration: none;
+  }}
+
   /* Severity / status badges */
   .ce-badge {{
       display: inline-block;
@@ -140,3 +160,17 @@ def severity_badge(severity: str) -> str:
     """Return an HTML badge string for a severity level."""
     cls = f"ce-badge-{severity.lower()}"
     return f'<span class="ce-badge {cls}">{severity.upper()}</span>'
+
+
+def directions_url(latitude: float, longitude: float) -> str:
+    """Google Maps directions URL to the given coordinates (from the user)."""
+    return f"https://www.google.com/maps/dir/?api=1&destination={latitude},{longitude}"
+
+
+def directions_link(latitude: float, longitude: float, label: str = "🧭 Get directions") -> None:
+    """Render a link that opens turn-by-turn directions to the coordinates."""
+    st.markdown(
+        f'<a href="{directions_url(latitude, longitude)}" target="_blank" '
+        f'rel="noopener" class="ce-directions">{label}</a>',
+        unsafe_allow_html=True,
+    )

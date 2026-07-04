@@ -32,6 +32,11 @@ class UploadResult:
     object_name: str
     bucket: str
     size_bytes: int
+    # Analysis the backend stored (real Gemini result when enabled, else the
+    # client-supplied mock echoed back). ``analysis_source`` is one of
+    # ``"gemini" | "client" | "error" | "none"``.
+    analysis: dict | None = None
+    analysis_source: str = "none"
 
 
 def _secret(name: str) -> str:
@@ -127,4 +132,6 @@ def upload_snapshot(
         object_name=payload.get("object_name", ""),
         bucket=payload.get("bucket", ""),
         size_bytes=payload.get("size_bytes", 0),
+        analysis=payload.get("analysis"),
+        analysis_source=payload.get("analysis_source", "none"),
     )

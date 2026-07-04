@@ -12,8 +12,6 @@ so Streamlit renders them empty — a clean reset without stale values.
 """
 from __future__ import annotations
 
-import time
-
 import pandas as pd
 import streamlit as st
 
@@ -81,12 +79,14 @@ def _upload_to_backend(
     latitude: float,
     longitude: float,
     analysis: dict,
-) -> tuple[str | None, str]:
+) -> tuple[upload_service.UploadResult | None, str]:
     """Store the snapshot (with its analysis) via the backend Cloud Function.
 
-    Returns ``(gs_uri, status)`` where ``status`` is one of
+    Returns ``(upload, status)`` where ``status`` is one of
     ``"skipped" | "success" | "failed"`` for explicit UI reporting. The analysis
-    is persisted as object metadata so the read screens can rebuild incidents.
+    is persisted as object metadata so the read screens can rebuild incidents;
+    the backend may replace it with its own (Gemini) analysis, returned on
+    :class:`~app.services.upload_service.UploadResult`.
     """
     if not upload_service.is_enabled():
         return None, "skipped"
@@ -99,7 +99,7 @@ def _upload_to_backend(
             longitude=longitude,
             analysis=analysis,
         )
-        return upload.gs_uri, "success"
+        return upload, "success"
     except upload_service.UploadError as exc:
         st.session_state["_upload_error"] = str(exc)
         return None, "failed"
@@ -113,28 +113,25 @@ def _run_analysis(
     latitude: float,
     longitude: float,
 ) -> None:
-    """Run the orchestration/agent pipeline with a visible, stateful status."""
-    with st.status(
-        "Running CivicEYEAI multi-agent analysis…", expanded=True
-    ) as status:
-        st.write("🛰️  Ingesting geo-tagged snapshot…")
-        time.sleep(0.4)
+    """Run the analysis pipeline behind a live status that tracks real work.
 
-        for agent in analysis_service.AGENTS:
-            st.write(f"{agent['icon']}  {agent['name']} scanning for {agent['label']}…")
-            time.sleep(0.4)
-        st.write("🧠  Issue Intelligence Layer scoring severity…")
-        time.sleep(0.4)
-        st.write("✨  Gemini generating recommendations…")
-        time.sleep(0.4)
-
-        # Run the analysis first so its result can be persisted with the image.
+    Each ``status.update`` reflects an actual stage that is about to run (upload
+    + backend Gemini analysis), so the animated spinner label always matches
+    what the system is really doing — no fabricated per-agent delays.
+    """
+    with st.status("Analyzing snapshot…", expanded=True) as status:
+        # Local analysis: the fallback display + the payload sent to a backend
+        # that isn't running its own AI. When Gemini is enabled the backend
+        # returns the authoritative result and we display that instead.
+        status.update(label="🛰️ Ingesting geo-tagged snapshot…")
         result = analysis_service.analyze(
             image_bytes, latitude, longitude, thumbnail=image
         )
 
-        st.write("☁️  Storing snapshot + analysis in Cloud Storage…")
-        gs_uri, upload_status = _upload_to_backend(
+        # This is the real latency: the backend stores the image and runs the
+        # Gemini vision analysis. The spinner keeps rotating for its duration.
+        status.update(label="✨ Running Gemini vision analysis in the cloud…")
+        upload, upload_status = _upload_to_backend(
             image_bytes,
             filename,
             content_type,
@@ -142,25 +139,41 @@ def _run_analysis(
             longitude,
             analysis=result.to_metadata(),
         )
-        if upload_status == "success":
-            st.write(f"✅  Stored in Cloud Storage → `{gs_uri}`")
-        elif upload_status == "skipped":
-            st.write("⏭️  Backend not configured — result not persisted.")
-        else:
-            err = st.session_state.get("_upload_error", "unknown error")
-            st.write(f"❌  Cloud Storage upload failed: {err}")
 
-        if upload_status == "failed":
+        # Prefer the backend's Gemini analysis over the local mock when present.
+        if upload and upload.analysis_source == "gemini" and upload.analysis:
+            result = analysis_service.from_metadata(
+                upload.analysis, latitude, longitude, thumbnail=image
+            )
+
+        if upload_status == "success":
+            src = upload.analysis_source if upload else "none"
+            n = len(result.detections)
             status.update(
-                label="Analysis complete (backend upload failed)",
-                state="error",
+                label=(
+                    f"✅ Analysis complete — {n} issue(s) detected"
+                    if src == "gemini"
+                    else "✅ Analysis complete"
+                ),
+                state="complete",
+                expanded=False,
+            )
+        elif upload_status == "skipped":
+            status.update(
+                label="✅ Analysis complete (local only — backend not configured)",
+                state="complete",
                 expanded=False,
             )
         else:
-            status.update(label="Analysis complete", state="complete", expanded=False)
+            err = st.session_state.get("_upload_error", "unknown error")
+            status.update(
+                label=f"❌ Cloud upload failed — {err}",
+                state="error",
+                expanded=False,
+            )
 
-    result.meta["gs_uri"] = gs_uri
     result.meta["upload_status"] = upload_status
+    result.meta["analysis_source"] = upload.analysis_source if upload else "none"
     # New snapshot persisted — drop the cached list so the read screens refetch.
     if upload_status == "success":
         incident_store.refresh()
@@ -168,11 +181,14 @@ def _run_analysis(
 
 
 def _render_backend_status(result: "analysis_service.AnalysisResult") -> None:
-    """Show the backend/Cloud Storage call state explicitly as a status chip."""
+    """Show the backend/Cloud Storage call state explicitly as a status chip.
+
+    Deliberately does not expose the internal ``gs://`` object path.
+    """
     status = result.meta.get("upload_status", "skipped")
-    gs_uri = result.meta.get("gs_uri")
     if status == "success":
-        st.success(f"☁️ Cloud Storage: **stored** · `{gs_uri}`", icon="✅")
+        engine = "Gemini AI" if result.meta.get("analysis_source") == "gemini" else "local analysis"
+        st.success(f"☁️ Snapshot stored & analyzed with {engine}.", icon="✅")
     elif status == "failed":
         err = st.session_state.get("_upload_error", "upload failed")
         st.error(f"☁️ Cloud Storage: **failed** — {err}", icon="❌")
@@ -205,12 +221,13 @@ def _render_result() -> None:
         st.write("")
         if result.detections:
             for det in result.detections:
+                sub = f" · {det.sub_type}" if det.sub_type else ""
                 st.markdown(
                     f"""
                     <div class="ce-agent">
                         <div class="ce-agent-icon">🔎</div>
                         <div style="flex:1">
-                            <div class="ce-agent-name">{det.agent} — {det.issue_type}</div>
+                            <div class="ce-agent-name">{det.agent} — {det.issue_type}{sub}</div>
                             <div class="ce-agent-sub">Confidence {det.confidence:.0%} · {det.recommendation}</div>
                         </div>
                         {styles.severity_badge(det.severity)}
@@ -224,6 +241,17 @@ def _render_result() -> None:
         st.write("")
         st.markdown("**✨ Gemini Recommendation**")
         st.info(result.summary)
+
+        # Location + one-tap directions so a crew can navigate to the site.
+        st.write("")
+        loc_col, dir_col = st.columns([2, 1])
+        with loc_col:
+            st.markdown(
+                f"📍 **Location:** {result.latitude:.6f}, {result.longitude:.6f}"
+            )
+        with dir_col:
+            styles.directions_link(result.latitude, result.longitude)
+
         caption = f"Analyzed at {result.analyzed_at}"
         if result.meta.get("upload_status") == "success":
             caption += " · added to Reported Incidents & Dashboard"

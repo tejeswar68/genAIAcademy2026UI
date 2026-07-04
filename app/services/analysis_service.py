@@ -39,6 +39,7 @@ class Detection:
     confidence: float          # 0.0 - 1.0
     severity: str              # High | Medium | Low
     recommendation: str
+    sub_type: str = ""         # finer category, e.g. "Medical waste"
 
 
 @dataclass
@@ -74,6 +75,7 @@ class AnalysisResult:
                 {
                     "agent": d.agent,
                     "issue_type": d.issue_type,
+                    "sub_type": d.sub_type,
                     "confidence": d.confidence,
                     "severity": d.severity,
                     "status": "Open",
@@ -82,6 +84,40 @@ class AnalysisResult:
                 for d in self.detections
             ],
         }
+
+
+def from_metadata(
+    meta: dict,
+    latitude: float,
+    longitude: float,
+    thumbnail: object = None,
+) -> AnalysisResult:
+    """Rebuild an :class:`AnalysisResult` from a backend analysis dict.
+
+    Used when the backend ran the real Gemini analysis and returned it: the
+    same result renderer then displays real detections instead of the mock.
+    Tolerates missing fields so a partial/legacy payload still renders.
+    """
+    detections = [
+        Detection(
+            agent=d.get("agent", ""),
+            issue_type=d.get("issue_type", "Unknown"),
+            sub_type=d.get("sub_type", ""),
+            confidence=float(d.get("confidence", 0.0) or 0.0),
+            severity=d.get("severity", "Low"),
+            recommendation=d.get("recommendation", ""),
+        )
+        for d in (meta.get("detections") or [])
+    ]
+    return AnalysisResult(
+        latitude=latitude,
+        longitude=longitude,
+        detections=detections,
+        summary=meta.get("summary", ""),
+        analyzed_at=meta.get("analyzed_at", ""),
+        thumbnail=thumbnail,
+        meta={"agents_run": len(AGENTS), "model": meta.get("model", "")},
+    )
 
 
 def _seed_from_image(image_bytes: bytes) -> int:

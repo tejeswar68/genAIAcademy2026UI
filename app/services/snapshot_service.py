@@ -58,6 +58,37 @@ def image_url(object_name: str) -> str:
     return f"{_endpoint('/image')}?object={object_name}"
 
 
+def list_incidents_bq() -> list[dict] | None:
+    """Fetch incident rows from the backend's BigQuery-backed endpoint.
+
+    Returns the incident dicts, or ``None`` when BigQuery is not enabled on the
+    backend (so the caller falls back to deriving incidents from snapshots).
+
+    Raises:
+        SnapshotError: If the backend request itself fails.
+    """
+    if not upload_service.is_enabled():
+        raise SnapshotError("No backend configured.")
+    try:
+        response = requests.get(
+            _endpoint("/incidents"),
+            headers=upload_service.auth_headers(),
+            timeout=_TIMEOUT,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except requests.RequestException as exc:
+        raise SnapshotError(f"Failed to fetch incidents: {exc}") from exc
+    except ValueError as exc:
+        raise SnapshotError("Backend returned an invalid response.") from exc
+
+    if not payload.get("success"):
+        raise SnapshotError(payload.get("detail", "Backend rejected the request."))
+    if not payload.get("enabled"):
+        return None  # BigQuery off — caller uses the snapshot-derived path
+    return payload.get("incidents", [])
+
+
 def fetch_image(object_name: str) -> bytes:
     """Fetch one snapshot's raw bytes through the backend image proxy.
 

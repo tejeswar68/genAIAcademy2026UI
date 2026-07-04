@@ -15,7 +15,7 @@ import streamlit as st
 from app.services import snapshot_service
 
 _COLUMNS = [
-    "id", "type", "agent", "severity", "confidence",
+    "id", "type", "sub_type", "agent", "severity", "confidence",
     "status", "lat", "lon", "reported",
 ]
 
@@ -41,6 +41,7 @@ def _rows_from_snapshot(snap: snapshot_service.Snapshot) -> list[dict]:
             {
                 "id": _incident_id(snap.object_name, i),
                 "type": det.get("issue_type", "Unknown"),
+                "sub_type": det.get("sub_type", ""),
                 "agent": det.get("agent", ""),
                 "severity": det.get("severity", "Low"),
                 "confidence": float(det.get("confidence", 0.0) or 0.0),
@@ -53,18 +54,47 @@ def _rows_from_snapshot(snap: snapshot_service.Snapshot) -> list[dict]:
     return rows
 
 
+def _rows_from_bq(incidents: list[dict]) -> list[dict]:
+    """Map BigQuery incident rows onto the DataFrame's ``_COLUMNS`` shape."""
+    return [
+        {
+            "id": inc.get("incident_id", ""),
+            "type": inc.get("issue_type", "Unknown"),
+            "sub_type": inc.get("sub_type", ""),
+            "agent": inc.get("agent", ""),
+            "severity": inc.get("severity", "Low"),
+            "confidence": float(inc.get("confidence", 0.0) or 0.0),
+            "status": inc.get("status", "Open"),
+            "lat": float(inc.get("latitude", 0.0) or 0.0),
+            "lon": float(inc.get("longitude", 0.0) or 0.0),
+            "reported": inc.get("reported_at", ""),
+        }
+        for inc in incidents
+    ]
+
+
 @st.cache_data(ttl=30, show_spinner=False)
 def all_incidents() -> pd.DataFrame:
-    """Return every incident derived from live Cloud Storage snapshots.
+    """Return every incident, preferring the BigQuery Civic Intelligence DB.
 
-    Cached briefly (30s) so a screen's reruns don't re-hit the backend on every
-    interaction; :func:`refresh` clears it after a new upload or on demand.
-    Returns an empty DataFrame (correct columns) when the backend is not
-    configured or unreachable, so screens degrade gracefully.
+    Reads from BigQuery via the backend (a single indexed query — low latency)
+    and falls back to deriving incidents from Cloud Storage snapshot metadata
+    when BigQuery is disabled or unreachable. Cached briefly (30s); cleared by
+    :func:`refresh` after a new upload. Returns an empty DataFrame (correct
+    columns) when nothing is available, so screens degrade gracefully.
     """
     if not snapshot_service.is_enabled():
         return pd.DataFrame(columns=_COLUMNS)
 
+    # Preferred path: BigQuery (box 8). ``None`` means BQ is off on the backend.
+    try:
+        bq_incidents = snapshot_service.list_incidents_bq()
+        if bq_incidents is not None:
+            return pd.DataFrame(_rows_from_bq(bq_incidents), columns=_COLUMNS)
+    except snapshot_service.SnapshotError:
+        pass  # fall through to the Cloud Storage-derived path
+
+    # Fallback: derive incidents from snapshot object metadata.
     try:
         snapshots = snapshot_service.list_snapshots()
     except snapshot_service.SnapshotError:

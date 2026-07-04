@@ -192,6 +192,7 @@ def _render_detail(snap: dict) -> None:
             _one_point(snap),
             "Location",
         )
+        styles.directions_link(snap["lat"], snap["lon"], "🧭 Directions to site")
 
     st.write("")
     with st.container(border=True):
@@ -218,15 +219,17 @@ def _one_point(snap: dict):
 def _render_detection(det: dict) -> None:
     """Render one detected issue as a detailed row."""
     confidence = float(det["confidence"])
-    sub = f"{det['agent']} · confidence {confidence:.0%} · {det['status']}"
+    sub_type = det.get("sub_type", "")
+    type_label = f"{det['type']} · {sub_type}" if sub_type else det["type"]
+    meta = f"{det['agent']} · confidence {confidence:.0%} · {det['status']}"
     st.markdown(
         f"""
         <div class="ce-agent">
             <div class="ce-agent-icon">🔎</div>
             <div style="flex:1">
-                <div class="ce-agent-name">{det['type']}
+                <div class="ce-agent-name">{type_label}
                     <span style="opacity:0.55;font-weight:500">· {det['id']}</span></div>
-                <div class="ce-agent-sub">{sub}</div>
+                <div class="ce-agent-sub">{meta}</div>
             </div>
             {styles.severity_badge(str(det['severity']))}
         </div>
