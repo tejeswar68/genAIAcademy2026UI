@@ -37,6 +37,9 @@ class UploadResult:
     # ``"gemini" | "client" | "error" | "none"``.
     analysis: dict | None = None
     analysis_source: str = "none"
+    # Whether the backend persisted this snapshot as an incident. False when no
+    # civic issue was detected (off-topic or clean scene) — nothing is stored.
+    stored: bool = True
 
 
 def _secret(name: str) -> str:
@@ -134,4 +137,5 @@ def upload_snapshot(
         size_bytes=payload.get("size_bytes", 0),
         analysis=payload.get("analysis"),
         analysis_source=payload.get("analysis_source", "none"),
+        stored=bool(payload.get("stored", True)),
     )

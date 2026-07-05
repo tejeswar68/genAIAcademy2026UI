@@ -40,6 +40,8 @@ class Detection:
     severity: str              # High | Medium | Low
     recommendation: str
     sub_type: str = ""         # finer category, e.g. "Medical waste"
+    # Bounding box [ymin, xmin, ymax, xmax] on a 0-1000 scale; empty if none.
+    box: list = field(default_factory=list)
 
 
 @dataclass
@@ -53,6 +55,9 @@ class AnalysisResult:
     analyzed_at: str
     thumbnail: object = None   # PIL image, optional (for dashboard/incidents)
     meta: dict = field(default_factory=dict)
+    # False when the upload isn't a civic scene (selfie, document, etc.).
+    relevant: bool = True
+    relevance_note: str = ""
 
     @property
     def top_severity(self) -> str:
@@ -71,6 +76,8 @@ class AnalysisResult:
         return {
             "analyzed_at": self.analyzed_at,
             "summary": self.summary,
+            "relevant": self.relevant,
+            "relevance_note": self.relevance_note,
             "detections": [
                 {
                     "agent": d.agent,
@@ -80,6 +87,7 @@ class AnalysisResult:
                     "severity": d.severity,
                     "status": "Open",
                     "recommendation": d.recommendation,
+                    "box": d.box,
                 }
                 for d in self.detections
             ],
@@ -106,6 +114,7 @@ def from_metadata(
             confidence=float(d.get("confidence", 0.0) or 0.0),
             severity=d.get("severity", "Low"),
             recommendation=d.get("recommendation", ""),
+            box=list(d.get("box") or []),
         )
         for d in (meta.get("detections") or [])
     ]
@@ -117,6 +126,8 @@ def from_metadata(
         analyzed_at=meta.get("analyzed_at", ""),
         thumbnail=thumbnail,
         meta={"agents_run": len(AGENTS), "model": meta.get("model", "")},
+        relevant=bool(meta.get("relevant", True)),
+        relevance_note=meta.get("relevance_note", ""),
     )
 
 
@@ -146,6 +157,11 @@ def analyze(
                 severity = "Medium"
             else:
                 severity = "Low"
+            # Plausible box (0-1000 scale) so the annotated preview shows a
+            # region even in mock mode; deterministic via the seeded rng.
+            x0 = rng.randint(80, 520)
+            y0 = rng.randint(80, 520)
+            box = [y0, x0, y0 + rng.randint(200, 380), x0 + rng.randint(200, 380)]
             detections.append(
                 Detection(
                     agent=agent["name"],
@@ -153,6 +169,7 @@ def analyze(
                     confidence=confidence,
                     severity=severity,
                     recommendation=_RECOMMENDATIONS[agent["key"]],
+                    box=box,
                 )
             )
 

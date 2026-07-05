@@ -12,13 +12,32 @@ so Streamlit renders them empty — a clean reset without stale values.
 """
 from __future__ import annotations
 
+import threading
+
 import pandas as pd
 import streamlit as st
 
 from app import styles
 from app.config import settings
 from app.services import analysis_service, incident_store, upload_service
-from app.services.image_service import ImageLoadError, load_image
+from app.services.image_service import ImageLoadError, annotate_detections, load_image
+
+# Backend pipeline steps, shown one at a time (~2s each) while the real cloud
+# call runs. These mirror what the backend actually does per snapshot; the
+# status advances dynamically and loops on the last steps until the call
+# returns, so it always tracks in-flight work rather than a fixed delay.
+_PIPELINE_STEPS = (
+    "🛰️ Ingesting geo-tagged snapshot…",
+    "☁️ Uploading to Google Cloud Storage…",
+    "🧠 Vertex AI · loading Gemini 2.5 vision model…",
+    "🗑️ Waste Agent · scanning for garbage & litter…",
+    "🌊 Drainage Agent · checking drains & flooding…",
+    "🕳️ Safety Agent · detecting manholes & road hazards…",
+    "📐 Localizing issues & drawing detection boxes…",
+    "✨ Gemini · generating recommendations & severity…",
+    "🗄️ Writing incidents to BigQuery…",
+)
+_STEP_SECONDS = 2.0
 
 # Session-state keys.
 _NONCE = "upload_nonce"          # int — bumped to reset input widgets
@@ -79,17 +98,17 @@ def _upload_to_backend(
     latitude: float,
     longitude: float,
     analysis: dict,
-) -> tuple[upload_service.UploadResult | None, str]:
+) -> tuple[upload_service.UploadResult | None, str, str]:
     """Store the snapshot (with its analysis) via the backend Cloud Function.
 
-    Returns ``(upload, status)`` where ``status`` is one of
-    ``"skipped" | "success" | "failed"`` for explicit UI reporting. The analysis
-    is persisted as object metadata so the read screens can rebuild incidents;
-    the backend may replace it with its own (Gemini) analysis, returned on
-    :class:`~app.services.upload_service.UploadResult`.
+    Returns ``(upload, status, error)`` where ``status`` is one of
+    ``"skipped" | "success" | "failed"`` for explicit UI reporting and ``error``
+    carries the failure message (empty unless ``status == "failed"``). Pure with
+    respect to Streamlit state so it is safe to call from a worker thread — the
+    caller writes any ``st.session_state`` on the main thread.
     """
     if not upload_service.is_enabled():
-        return None, "skipped"
+        return None, "skipped", ""
     try:
         upload = upload_service.upload_snapshot(
             image_bytes,
@@ -99,10 +118,9 @@ def _upload_to_backend(
             longitude=longitude,
             analysis=analysis,
         )
-        return upload, "success"
+        return upload, "success", ""
     except upload_service.UploadError as exc:
-        st.session_state["_upload_error"] = str(exc)
-        return None, "failed"
+        return None, "failed", str(exc)
 
 
 def _run_analysis(
@@ -119,26 +137,43 @@ def _run_analysis(
     + backend Gemini analysis), so the animated spinner label always matches
     what the system is really doing — no fabricated per-agent delays.
     """
-    with st.status("Analyzing snapshot…", expanded=True) as status:
-        # Local analysis: the fallback display + the payload sent to a backend
-        # that isn't running its own AI. When Gemini is enabled the backend
-        # returns the authoritative result and we display that instead.
-        status.update(label="🛰️ Ingesting geo-tagged snapshot…")
-        result = analysis_service.analyze(
-            image_bytes, latitude, longitude, thumbnail=image
-        )
+    # Local analysis: the fallback display + the payload sent to a backend that
+    # isn't running its own AI. When Gemini is enabled the backend returns the
+    # authoritative result and we display that instead.
+    result = analysis_service.analyze(
+        image_bytes, latitude, longitude, thumbnail=image
+    )
 
-        # This is the real latency: the backend stores the image and runs the
-        # Gemini vision analysis. The spinner keeps rotating for its duration.
-        status.update(label="✨ Running Gemini vision analysis in the cloud…")
-        upload, upload_status = _upload_to_backend(
-            image_bytes,
-            filename,
-            content_type,
-            latitude,
-            longitude,
+    # Run the (blocking) backend call in a worker thread so the status can step
+    # through the real pipeline stages (~2s each) while the cloud work is in
+    # flight. The thread only does the network I/O and hands its outcome back
+    # via ``out`` — all st.session_state writes stay on the main thread.
+    out: dict = {}
+
+    def _worker() -> None:
+        out["upload"], out["status"], out["error"] = _upload_to_backend(
+            image_bytes, filename, content_type, latitude, longitude,
             analysis=result.to_metadata(),
         )
+
+    worker = threading.Thread(target=_worker, daemon=True)
+
+    with st.status("Analyzing snapshot…", expanded=True) as status:
+        worker.start()
+        # Advance one step every ~2s; hold on the last step until the call ends
+        # so the label always reflects work still in progress.
+        step = 0
+        while worker.is_alive():
+            status.update(label=_PIPELINE_STEPS[min(step, len(_PIPELINE_STEPS) - 1)])
+            step += 1
+            worker.join(timeout=_STEP_SECONDS)
+        worker.join()
+
+        upload, upload_status = out.get("upload"), out.get("status", "failed")
+        upload_error = out.get("error", "")
+        # Surface the error on the main thread (never from the worker).
+        if upload_error:
+            st.session_state["_upload_error"] = upload_error
 
         # Prefer the backend's Gemini analysis over the local mock when present.
         if upload and upload.analysis_source == "gemini" and upload.analysis:
@@ -146,9 +181,18 @@ def _run_analysis(
                 upload.analysis, latitude, longitude, thumbnail=image
             )
 
-        if upload_status == "success":
+        # Backend skips storage when no civic issue is found — reflect that.
+        not_stored = bool(upload) and not getattr(upload, "stored", True)
+        n = len(result.detections)
+
+        if upload_status == "success" and not_stored:
+            status.update(
+                label="✅ Analysis complete — no civic issue to report",
+                state="complete",
+                expanded=False,
+            )
+        elif upload_status == "success":
             src = upload.analysis_source if upload else "none"
-            n = len(result.detections)
             status.update(
                 label=(
                     f"✅ Analysis complete — {n} issue(s) detected"
@@ -174,8 +218,9 @@ def _run_analysis(
 
     result.meta["upload_status"] = upload_status
     result.meta["analysis_source"] = upload.analysis_source if upload else "none"
-    # New snapshot persisted — drop the cached list so the read screens refetch.
-    if upload_status == "success":
+    result.meta["stored"] = (not not_stored) if upload_status == "success" else False
+    # A new incident was persisted only when the backend actually stored it.
+    if upload_status == "success" and not not_stored:
         incident_store.refresh()
     st.session_state[_RESULT] = result
 
@@ -188,7 +233,11 @@ def _render_backend_status(result: "analysis_service.AnalysisResult") -> None:
     status = result.meta.get("upload_status", "skipped")
     if status == "success":
         engine = "Gemini AI" if result.meta.get("analysis_source") == "gemini" else "local analysis"
-        st.success(f"☁️ Snapshot stored & analyzed with {engine}.", icon="✅")
+        if result.meta.get("stored", True):
+            st.success(f"☁️ Snapshot stored & analyzed with {engine}.", icon="✅")
+        else:
+            # Analyzed but intentionally not persisted (no civic issue found).
+            st.info(f"🔍 Analyzed with {engine} · not added to incidents.", icon="ℹ️")
     elif status == "failed":
         err = st.session_state.get("_upload_error", "upload failed")
         st.error(f"☁️ Cloud Storage: **failed** — {err}", icon="❌")
@@ -208,6 +257,37 @@ def _render_result() -> None:
 
         _render_backend_status(result)
 
+        # Nothing-to-report gate. Two cases, neither persisted as an incident:
+        #   1. Off-topic upload (selfie, document, indoor photo…) — not a scene.
+        #   2. A valid civic scene that happens to be clean (no issues found).
+        # Either way, show a clear message instead of a fake "0 issues" result.
+        if not result.relevant or not result.detections:
+            st.write("")
+            if not result.relevant:
+                note = result.relevance_note or "the image does not appear to be a civic scene"
+                st.warning(
+                    f"⚠️ **This image isn't ideal for civic analysis.** "
+                    f"CivicEye AI expects a drone snapshot of a street, road, drain, "
+                    f"or public area — but {note}. Please upload a relevant snapshot.",
+                    icon="🚫",
+                )
+            else:
+                st.success(
+                    "✅ **No civic issues detected.** This area looks clear, so "
+                    "nothing was added to Reported Incidents.",
+                    icon="🌿",
+                )
+            if result.thumbnail is not None:
+                st.write("")
+                st.image(result.thumbnail, caption="Uploaded image · CivicEye AI", width="stretch")
+            st.write("")
+            st.button(
+                "⬆️ Upload Another Image",
+                on_click=_reset_for_new_upload,
+                width="stretch",
+            )
+            return
+
         st.write("")
         top = result.top_severity
         c1, c2, c3 = st.columns(3)
@@ -217,6 +297,19 @@ def _render_result() -> None:
             unsafe_allow_html=True,
         )
         c3.metric("Agents Run", result.meta.get("agents_run", 0))
+
+        # Annotated snapshot: draw the AI-detected regions on the image so the
+        # operator sees exactly *where* each issue is, not just that one exists.
+        if result.thumbnail is not None:
+            st.write("")
+            located = [d for d in result.detections if getattr(d, "box", None)]
+            annotated = annotate_detections(result.thumbnail, result.detections)
+            caption = (
+                "AI-highlighted issue regions · CivicEye AI"
+                if located
+                else "Analyzed snapshot · CivicEye AI"
+            )
+            st.image(annotated, caption=caption, width="stretch")
 
         st.write("")
         if result.detections:
